@@ -7,6 +7,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -67,7 +68,7 @@ func saveData() {
 
 // Форматирует текущее время как "MM-dd EEE HH:MM"
 func getFormattedNow() string {
-	return time.Now().Format("01-02 Mon 15:04")
+	return time.Now().Add(3 * time.Hour).Format("01-02 Mon 15:04")
 }
 
 // Парсит строку вида "01-02 Mon 15:04" → time.Time
@@ -79,7 +80,7 @@ func parseVkidTime(s string) (time.Time, error) {
 	datePart := parts[0] // MM-dd
 	timePart := parts[2] // HH:MM
 
-	now := time.Now()
+	now := time.Now().Add(3 * time.Hour)
 	currentYear := now.Year()
 
 	// Попробуем текущий год
@@ -118,12 +119,33 @@ func timeSinceLast(vkids []string) string {
 	return fmt.Sprintf("%d:%02d", hours, minutes)
 }
 
+type BOT struct {
+	bot *tgbotapi.BotAPI
+	mu  *sync.Mutex
+}
+
+func (b *BOT) Send(c tgbotapi.Chattable) (tgbotapi.Message, error) {
+	b.mu.Lock()
+
+	msg, err := b.bot.Send(c)
+	if err != nil {
+		return tgbotapi.Message{}, err
+	}
+
+	return msg, nil
+}
+
 func main() {
 	token := "8244558007:AAENGj8YGU0irK5W4O6PnNQXR-88100cNpU"
 
 	bot, err := tgbotapi.NewBotAPI(token)
 	if err != nil {
 		log.Fatal(err)
+	}
+
+	Bot := &BOT{
+		bot: bot,
+		mu:  &sync.Mutex{},
 	}
 
 	log.Printf("Бот запущен как @%s", bot.Self.UserName)
@@ -136,28 +158,6 @@ func main() {
 	updates := bot.GetUpdatesChan(u)
 
 	// Горутина для напоминаний
-	go func() {
-		ticker := time.NewTicker(10 * time.Minute)
-		defer ticker.Stop()
-		for range ticker.C {
-			now := time.Now()
-			for chatID, userData := range users {
-				if userData.ReminderHours <= 0 || len(userData.Vkids) == 0 {
-					continue
-				}
-				lastStr := userData.Vkids[len(userData.Vkids)-1]
-				t, err := parseVkidTime(lastStr)
-				if err != nil {
-					continue
-				}
-				sinceHours := int(now.Sub(t).Hours())
-				if sinceHours >= userData.ReminderHours && sinceHours%userData.ReminderHours == 0 {
-					msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("Прошло %d часов с последнего вкида!", userData.ReminderHours))
-					bot.Send(msg)
-				}
-			}
-		}
-	}()
 
 	for update := range updates {
 		// Обработка сообщений
@@ -183,23 +183,25 @@ func main() {
 				)
 				msg := tgbotapi.NewMessage(chatID, "Готов отслеживать твои вкиды!")
 				msg.ReplyMarkup = kb
-				bot.Send(msg)
+				Bot.bot.Send(msg)
 
 			case "вкинулся":
+				timeSleep := users[chatID].ReminderHours
+				setRemind(Bot, time.Now(), chatID, timeSleep)
 				formatted := getFormattedNow() // например: "04-05 Fri 14:30"
 				userData.Vkids = append(userData.Vkids, formatted)
 				saveData()
-				bot.Send(tgbotapi.NewMessage(chatID, "✅ Записано: "+formatted))
+				Bot.bot.Send(tgbotapi.NewMessage(chatID, "✅ Записано: "+formatted))
 
 			case "сколько прошло":
 				result := timeSinceLast(userData.Vkids)
-				bot.Send(tgbotapi.NewMessage(chatID, "⏱ Прошло: "+result))
+				Bot.bot.Send(tgbotapi.NewMessage(chatID, "⏱ Прошло: "+result))
 
 			case "/file":
 				if _, err := os.Stat(dataFile); err == nil {
-					bot.Send(tgbotapi.NewDocument(chatID, tgbotapi.FilePath(dataFile)))
+					Bot.bot.Send(tgbotapi.NewDocument(chatID, tgbotapi.FilePath(dataFile)))
 				} else {
-					bot.Send(tgbotapi.NewMessage(chatID, "Файл данных пока пуст. Сделай хотя бы один 'вкид'."))
+					Bot.bot.Send(tgbotapi.NewMessage(chatID, "Файл данных пока пуст. Сделай хотя бы один 'вкид'."))
 				}
 			case "Меню":
 				inlineKeyboard := tgbotapi.NewInlineKeyboardMarkup(
@@ -212,7 +214,7 @@ func main() {
 				)
 				msg := tgbotapi.NewMessage(chatID, "⚙️ Настройки:")
 				msg.ReplyMarkup = inlineKeyboard
-				bot.Send(msg)
+				Bot.bot.Send(msg)
 
 			default:
 				// Ожидание ввода периода
@@ -220,9 +222,9 @@ func main() {
 					if hours, err := strconv.Atoi(text); err == nil && hours > 0 {
 						userData.ReminderHours = hours
 						saveData()
-						bot.Send(tgbotapi.NewMessage(chatID, fmt.Sprintf("🔔 Напоминания каждые %d ч.", hours)))
+						Bot.bot.Send(tgbotapi.NewMessage(chatID, fmt.Sprintf("🔔 Напоминания каждые %d ч.", hours)))
 					} else {
-						bot.Send(tgbotapi.NewMessage(chatID, "❌ Введите целое число > 0."))
+						Bot.bot.Send(tgbotapi.NewMessage(chatID, "❌ Введите целое число > 0."))
 					}
 				}
 			}
@@ -245,7 +247,7 @@ func main() {
 				saveData()
 				resp = tgbotapi.NewCallback(cb.ID, "")
 				bot.Request(resp)
-				bot.Send(tgbotapi.NewMessage(chatID, "Введите периодичность напоминаний (часы):"))
+				Bot.bot.Send(tgbotapi.NewMessage(chatID, "Введите периодичность напоминаний (часы):"))
 
 			case "delete_last":
 				if len(userData.Vkids) == 0 {
@@ -255,9 +257,20 @@ func main() {
 					saveData()
 					resp = tgbotapi.NewCallback(cb.ID, "Удалено")
 				}
-				bot.Request(resp)
+				Bot.bot.Request(resp)
 
 			}
 		}
 	}
+}
+
+func setRemind(Bot *BOT, timeNow time.Time, id int64, timeWait int) {
+	go func() {
+
+		time.Sleep(time.Duration(timeWait) * time.Hour)
+
+		msg := tgbotapi.NewMessage(id, fmt.Sprintf("Прошло %d часов с последнего вкида!", timeWait))
+		Bot.bot.Send(msg)
+
+	}()
 }
